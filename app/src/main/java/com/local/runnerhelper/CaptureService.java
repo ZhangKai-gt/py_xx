@@ -24,16 +24,22 @@ import android.provider.Settings;
 import android.view.Gravity;
 import android.view.WindowManager;
 import android.widget.Button;
+import android.widget.Toast;
 
 import java.nio.ByteBuffer;
 
 public class CaptureService extends Service {
     public static final String EXTRA_RESULT_CODE = "result_code";
     public static final String EXTRA_RESULT_DATA = "result_data";
-    public static final String EXTRA_DRY_RUN = "dry_run";
+    public static final String EXTRA_AUTO_MODE = "auto_mode";
 
     private static final String CHANNEL_ID = "runner_capture";
     private static final int NOTIFICATION_ID = 101;
+    private static volatile boolean running = false;
+
+    public static boolean isRunning() {
+        return running;
+    }
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final ObstacleDetector detector = new ObstacleDetector();
@@ -45,8 +51,9 @@ public class CaptureService extends Service {
     private ImageReader reader;
     private WindowManager windowManager;
     private Button bubble;
+    private DiagnosticSession diagnostic;
 
-    private boolean dryRun = true;
+    private boolean autoMode = false;
     private volatile boolean paused = false;
     private long lastFrameAt = 0L;
     private long lastActionAt = 0L;
@@ -54,6 +61,7 @@ public class CaptureService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
+        running = true;
         createChannel();
         captureThread = new HandlerThread("runner-capture");
         captureThread.start();
@@ -72,12 +80,13 @@ public class CaptureService extends Service {
             return START_NOT_STICKY;
         }
 
-        dryRun = intent.getBooleanExtra(EXTRA_DRY_RUN, true);
+        autoMode = intent.getBooleanExtra(EXTRA_AUTO_MODE, false);
         int resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, 0);
         Intent resultData;
         if (Build.VERSION.SDK_INT >= 33) {
             resultData = intent.getParcelableExtra(EXTRA_RESULT_DATA, Intent.class);
         } else {
+            //noinspection deprecation
             resultData = intent.getParcelableExtra(EXTRA_RESULT_DATA);
         }
 
@@ -86,11 +95,17 @@ public class CaptureService extends Service {
             return START_NOT_STICKY;
         }
 
+        try {
+            diagnostic = new DiagnosticSession(this, autoMode);
+        } catch (Exception ignored) {
+            diagnostic = null;
+        }
+
         startProjection(resultCode, resultData);
         createBubble();
         getSystemService(NotificationManager.class).notify(
                 NOTIFICATION_ID,
-                notification(dryRun ? "识别中" : "自动中"));
+                notification(autoMode ? "自动" : "诊断"));
         return START_NOT_STICKY;
     }
 
@@ -146,22 +161,60 @@ public class CaptureService extends Service {
                     plane.getPixelStride(),
                     plane.getRowStride());
 
-            updateBubble(d.action);
+            if (diagnostic != null) {
+                diagnostic.recordDecision(d, now);
+                diagnostic.maybeCapture(image, d, now);
+            }
 
-            if (paused || dryRun || d.action == ObstacleDetector.Action.NONE) return;
+            updateBubble(d);
+
+            if (paused || !autoMode || d.action == ObstacleDetector.Action.NONE) return;
 
             GameAccessibilityService gestures = GameAccessibilityService.getInstance();
             if (gestures == null) {
                 setBubble("!");
+                if (diagnostic != null) {
+                    diagnostic.recordGesture("GESTURE_MISSING", d.action.name(), "accessibility-service-null");
+                }
                 return;
             }
 
-            long cooldown = d.action == ObstacleDetector.Action.JUMP ? 720L : 560L;
+            long cooldown;
+            if (d.source == ObstacleDetector.Source.REWARD) {
+                cooldown = 520L;
+            } else if (d.action == ObstacleDetector.Action.JUMP) {
+                cooldown = 650L;
+            } else {
+                cooldown = 500L;
+            }
             if (now - lastActionAt < cooldown) return;
 
+            GameAccessibilityService.GestureListener listener = new GameAccessibilityService.GestureListener() {
+                @Override
+                public void onCompleted(String action) {
+                    if (diagnostic != null) {
+                        diagnostic.recordGesture("GESTURE_OK", action, d.source.name());
+                    }
+                }
+
+                @Override
+                public void onCancelled(String action) {
+                    if (diagnostic != null) {
+                        diagnostic.recordGesture("GESTURE_CANCEL", action, d.source.name());
+                    }
+                }
+            };
+
             boolean sent = d.action == ObstacleDetector.Action.JUMP
-                    ? gestures.jump()
-                    : gestures.slideDown();
+                    ? gestures.jump(listener)
+                    : gestures.slideDown(listener);
+
+            if (diagnostic != null) {
+                diagnostic.recordGesture(
+                        sent ? "GESTURE_SENT" : "GESTURE_REJECTED",
+                        d.action.name(),
+                        d.source.name() + ";x=" + d.xNorm);
+            }
             if (sent) lastActionAt = now;
         } finally {
             image.close();
@@ -174,45 +227,45 @@ public class CaptureService extends Service {
         windowManager = getSystemService(WindowManager.class);
         bubble = new Button(this);
         bubble.setAllCaps(false);
-        bubble.setTextSize(20);
+        bubble.setTextSize(17);
         bubble.setTextColor(Color.WHITE);
         bubble.setPadding(0, 0, 0, 0);
+        bubble.setMinWidth(0);
+        bubble.setMinHeight(0);
 
         GradientDrawable bg = new GradientDrawable();
-        bg.setColor(Color.argb(218, 20, 20, 20));
-        bg.setCornerRadius(dp(28));
-        bg.setStroke(dp(1), Color.argb(180, 85, 85, 85));
+        bg.setColor(Color.argb(210, 17, 17, 17));
+        bg.setCornerRadius(dp(22));
+        bg.setStroke(dp(1), Color.argb(155, 85, 85, 85));
         bubble.setBackground(bg);
-        bubble.setText(dryRun ? "识" : "自");
+        bubble.setText(autoMode ? "自" : "诊");
         bubble.setOnClickListener(v -> {
             paused = !paused;
-            bubble.setText(paused ? "Ⅱ" : (dryRun ? "识" : "自"));
+            bubble.setText(paused ? "Ⅱ" : (autoMode ? "自" : "诊"));
         });
 
         WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
-                dp(56),
-                dp(56),
+                dp(44),
+                dp(44),
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
                         | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
                 PixelFormat.TRANSLUCENT);
         lp.gravity = Gravity.TOP | Gravity.START;
-        lp.x = dp(10);
-        lp.y = dp(150);
+        lp.x = dp(8);
+        lp.y = dp(145);
         windowManager.addView(bubble, lp);
     }
 
-    private void updateBubble(ObstacleDetector.Action action) {
+    private void updateBubble(ObstacleDetector.Decision d) {
         if (bubble == null || paused) return;
-        String text;
-        if (action == ObstacleDetector.Action.JUMP) {
-            text = "↑";
-        } else if (action == ObstacleDetector.Action.SLIDE) {
-            text = "↓";
+        if (d.action == ObstacleDetector.Action.JUMP) {
+            setBubble(d.source == ObstacleDetector.Source.REWARD ? "+" : "↑");
+        } else if (d.action == ObstacleDetector.Action.SLIDE) {
+            setBubble("↓");
         } else {
-            text = dryRun ? "识" : "自";
+            setBubble(autoMode ? "自" : "诊");
         }
-        setBubble(text);
     }
 
     private void setBubble(String text) {
@@ -241,6 +294,8 @@ public class CaptureService extends Service {
 
     @Override
     public void onDestroy() {
+        running = false;
+
         if (reader != null) reader.setOnImageAvailableListener(null, null);
         if (display != null) display.release();
         if (projection != null) {
@@ -257,6 +312,23 @@ public class CaptureService extends Service {
             }
         }
         if (captureThread != null) captureThread.quitSafely();
+
+        if (diagnostic != null && !diagnostic.isFinished()) {
+            diagnostic.finishAsync((uri, fileName) -> mainHandler.post(() -> {
+                if (uri != null) {
+                    Toast.makeText(
+                            getApplicationContext(),
+                            "诊断包已保存：Download/RunnerDiag",
+                            Toast.LENGTH_LONG).show();
+                } else {
+                    Toast.makeText(
+                            getApplicationContext(),
+                            "诊断包保存失败",
+                            Toast.LENGTH_SHORT).show();
+                }
+            }));
+        }
+
         super.onDestroy();
     }
 
