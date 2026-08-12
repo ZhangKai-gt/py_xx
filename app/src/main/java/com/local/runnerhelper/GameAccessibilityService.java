@@ -9,6 +9,11 @@ import android.view.accessibility.AccessibilityEvent;
 public class GameAccessibilityService extends AccessibilityService {
     private static volatile GameAccessibilityService instance;
 
+    public interface GestureListener {
+        void onCompleted(String action);
+        void onCancelled(String action);
+    }
+
     public static GameAccessibilityService getInstance() {
         return instance;
     }
@@ -21,7 +26,6 @@ public class GameAccessibilityService extends AccessibilityService {
 
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
-        // V0.1 不读取其它应用的界面内容，只使用 dispatchGesture() 发送手势。
     }
 
     @Override
@@ -34,7 +38,7 @@ public class GameAccessibilityService extends AccessibilityService {
         return super.onUnbind(intent);
     }
 
-    public boolean jump() {
+    public boolean jump(GestureListener listener) {
         DisplayMetrics dm = getResources().getDisplayMetrics();
         float x = dm.widthPixels * 0.76f;
         float y = dm.heightPixels * 0.76f;
@@ -45,15 +49,13 @@ public class GameAccessibilityService extends AccessibilityService {
         GestureDescription.StrokeDescription stroke =
                 new GestureDescription.StrokeDescription(path, 0, 45);
 
-        return dispatchGesture(
+        return dispatch("JUMP",
                 new GestureDescription.Builder().addStroke(stroke).build(),
-                null,
-                null);
+                listener);
     }
 
-    public boolean slideDown() {
+    public boolean slideDown(GestureListener listener) {
         DisplayMetrics dm = getResources().getDisplayMetrics();
-
         float x = dm.widthPixels * 0.76f;
         float y1 = dm.heightPixels * 0.62f;
         float y2 = dm.heightPixels * 0.82f;
@@ -65,9 +67,27 @@ public class GameAccessibilityService extends AccessibilityService {
         GestureDescription.StrokeDescription stroke =
                 new GestureDescription.StrokeDescription(path, 0, 115);
 
-        return dispatchGesture(
+        return dispatch("SLIDE",
                 new GestureDescription.Builder().addStroke(stroke).build(),
-                null,
+                listener);
+    }
+
+    private boolean dispatch(String action,
+                             GestureDescription gesture,
+                             GestureListener listener) {
+        return dispatchGesture(
+                gesture,
+                new GestureResultCallback() {
+                    @Override
+                    public void onCompleted(GestureDescription gestureDescription) {
+                        if (listener != null) listener.onCompleted(action);
+                    }
+
+                    @Override
+                    public void onCancelled(GestureDescription gestureDescription) {
+                        if (listener != null) listener.onCancelled(action);
+                    }
+                },
                 null);
     }
 }
